@@ -296,6 +296,30 @@ export class WebSocketClient {
       payload: { newElement: element, roomId },
     });
 
+    this.updateBoardState({ roomId, element });
+  };
+
+  private handleElementMove = ({ userId, payload }: Args) => {
+    const { element, roomId } = payload;
+
+    // broadcast this into the room
+    this.broadCastRoom({ userId, type: "move-element", payload });
+
+    this.updateBoardState({ roomId, element });
+  };
+
+  private handleElementResize = ({ userId, payload }: Args) => {
+    const { element, roomId } = payload;
+
+    this.broadCastRoom({ userId, type: "resize-element", payload });
+
+    this.updateBoardState({
+      roomId,
+      element,
+    });
+  };
+
+  private updateBoardState = ({ roomId, element }: BoardStateUpdate) => {
     // Ensure the room exists in BoardState
     const boardState = this.BoardState.get(roomId);
     if (!boardState) {
@@ -322,6 +346,8 @@ export class WebSocketClient {
     this.on("leave-room", this.leaveRoom, userId);
     this.on("mouse-position", this.handleMousePosition, userId);
     this.on("drawing-element", this.handleNewElement, userId);
+    this.on("element-resize", this.handleElementResize, userId);
+    this.on("element-moves", this.handleElementMove, userId);
   };
 }
 
@@ -360,4 +386,9 @@ interface UserDetails {
 interface NewElementPayload {
   element: Element;
   roomId: string;
+}
+
+interface BoardStateUpdate {
+  roomId: string;
+  element: Element;
 }
