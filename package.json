@@ -15,9 +15,11 @@
   "dependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.1",
+    "@types/randomcolor": "^0.5.9",
     "@types/ws": "^8.18.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "randomcolor": "^0.6.2",
     "ws": "^8.18.1"
   }
 }
