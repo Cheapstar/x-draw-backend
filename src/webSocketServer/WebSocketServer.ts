@@ -89,16 +89,29 @@ export class WebSocketClient {
       ws.on("close", () => {
         console.log("Client connection closed for userId:", userId);
 
-        // Cleanup resources
-        if (userId) {
-          this.CLIENTS.delete(userId);
-          this.handlers.delete(userId);
+        // Check if the user is part of any room
+        let userRoomId: string | null = null;
 
-          // Remove user from all rooms
-          this.Rooms.forEach((roomUsers) => {
+        this.Rooms.forEach((roomUsers, roomId) => {
+          if (roomUsers.has(userId)) {
+            userRoomId = roomId;
             roomUsers.delete(userId);
+          }
+        });
+
+        // Broadcast that user left the room
+        if (userRoomId) {
+          console.log(`User ${userId} left room ${userRoomId}`);
+          this.broadCastRoom({
+            userId,
+            type: "remove-participant",
+            payload: { roomId: userRoomId, userId },
           });
         }
+
+        // Cleanup resources
+        this.CLIENTS.delete(userId);
+        this.handlers.delete(userId);
       });
 
       // Add error handling for WebSocket
@@ -252,6 +265,10 @@ export class WebSocketClient {
         type: "remove-participant",
         payload: { roomId: payload.roomId, userId },
       });
+
+      if (this.Rooms.get(payload.roomId)?.size === 0) {
+        this.Rooms.delete(payload.roomId);
+      }
     }
   };
 
@@ -319,6 +336,31 @@ export class WebSocketClient {
     });
   };
 
+  private eraseElements = (eraseElements: Element[], roomId: string) => {
+    const boardState = this.BoardState.get(roomId);
+
+    if (!boardState) {
+      console.warn(`No board state found for room: ${roomId}`);
+      return;
+    }
+
+    boardState.elements.filter(
+      (element) =>
+        !eraseElements.some((eraseElement) => eraseElement.id === element.id)
+    );
+  };
+
+  private handleElementErase = ({ userId, payload }: Args) => {
+    this.broadCastRoom({ userId, type: "erase-elements", payload });
+    this.eraseElements(payload.elements, payload.roomId);
+  };
+
+  private handleElementUpdate = ({ userId, payload }: Args) => {
+    this.broadCastRoom({ userId, type: "update-element", payload });
+
+    this.updateBoardState({ roomId: payload.roomId, element: payload.element });
+  };
+
   private updateBoardState = ({ roomId, element }: BoardStateUpdate) => {
     // Ensure the room exists in BoardState
     const boardState = this.BoardState.get(roomId);
@@ -348,6 +390,8 @@ export class WebSocketClient {
     this.on("drawing-element", this.handleNewElement, userId);
     this.on("element-resize", this.handleElementResize, userId);
     this.on("element-moves", this.handleElementMove, userId);
+    this.on("elements-erase", this.handleElementErase, userId);
+    this.on("element-update", this.handleElementUpdate, userId);
   };
 }
 
