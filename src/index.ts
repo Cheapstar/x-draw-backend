@@ -3,7 +3,7 @@ import cors from "cors";
 import { WebSocketClient } from "./webSocketServer/WebSocketServer";
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 const ELEMENTS_STORAGE = new Map<string, any>();
 

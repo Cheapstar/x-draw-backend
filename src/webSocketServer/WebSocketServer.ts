@@ -2,7 +2,7 @@ import { Server as HTTPServer } from "http";
 import WebSocket from "ws";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
-import { Element, Point } from "../types";
+import { Element, ImageElement, Point } from "../types";
 import randomColor from "randomcolor";
 
 export class WebSocketClient {
@@ -361,6 +361,18 @@ export class WebSocketClient {
     this.updateBoardState({ roomId: payload.roomId, element: payload.element });
   };
 
+  private handleImageAdd = ({ userId, payload }: Args) => {
+    console.log("Image is Received");
+    this.broadCastRoom({ userId, type: "add-images", payload });
+
+    for (let i = 0; i < payload.elements.length; i++) {
+      this.updateBoardState({
+        roomId: payload.roomId,
+        element: payload.elements[i],
+      });
+    }
+  };
+
   private updateBoardState = ({ roomId, element }: BoardStateUpdate) => {
     // Ensure the room exists in BoardState
     const boardState = this.BoardState.get(roomId);
@@ -370,9 +382,19 @@ export class WebSocketClient {
     }
 
     // Update elements immutably
-    const updatedElements = boardState.elements.map((ele) =>
-      ele.id === element.id ? element : ele
-    );
+    const updatedElements = boardState.elements.map((ele) => {
+      if (ele.id === element.id) {
+        if (element.type === "image") {
+          return {
+            ...element,
+            url: (ele as ImageElement).url,
+          };
+        }
+
+        return element;
+      }
+      return ele;
+    });
 
     // If element is new, add it
     if (!updatedElements.some((ele) => ele.id === element.id)) {
@@ -392,6 +414,7 @@ export class WebSocketClient {
     this.on("element-moves", this.handleElementMove, userId);
     this.on("elements-erase", this.handleElementErase, userId);
     this.on("element-update", this.handleElementUpdate, userId);
+    this.on("images-added", this.handleImageAdd, userId);
   };
 }
 
