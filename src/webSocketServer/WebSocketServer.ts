@@ -4,6 +4,7 @@ import { WebSocketServer } from "ws";
 import crypto from "crypto";
 import { Element, ImageElement, Point } from "../types";
 import randomColor from "randomcolor";
+import { Redis } from "ioredis";
 
 export class WebSocketClient {
   private wss: WebSocketServer;
@@ -11,13 +12,25 @@ export class WebSocketClient {
   private handlers: Map<string, Map<string, handlerFn[]>> = new Map(); // user ---> handlerfn
   private Rooms: Map<string, Map<string, UserDetails>> = new Map(); // room-Id --> userId,name
   private BoardState: Map<string, BoardStateType> = new Map(); // room-Id ---> {initialScale,panOffset,elements}
+  private redis: Redis;
+  private redisPublisher: Redis;
+  private redisSubscriber: Redis;
 
-  constructor(server: HTTPServer) {
+  constructor(
+    server: HTTPServer,
+    redis: Redis,
+    redisPublisher: Redis,
+    redisSubscriber: Redis
+  ) {
     if (!server) {
       throw new Error("HTTP Server is required to create WebSocket server");
     }
 
     this.wss = new WebSocketServer({ server });
+    this.redis = redis;
+    this.redisPublisher = redisPublisher;
+    this.redisSubscriber = redisSubscriber;
+    this.setUpRedis();
     this.connect();
   }
 
@@ -110,6 +123,7 @@ export class WebSocketClient {
         }
 
         // Cleanup resources
+        this.redis.del(`userId-${userId}`);
         this.CLIENTS.delete(userId);
         this.handlers.delete(userId);
       });
@@ -168,13 +182,16 @@ export class WebSocketClient {
     }
   };
 
-  send = (userId: string, type: string, payload: any) => {
+  send = async (userId: string, type: string, payload: any) => {
     if (!userId || !type) {
       console.error("Invalid send parameters");
       return;
     }
 
     const ws = this.CLIENTS.get(userId);
+    const userStatus = await this.redis.get(`userId-${userId}`);
+
+    if (userStatus != "1") return;
 
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
@@ -184,7 +201,14 @@ export class WebSocketClient {
         console.error("Error sending WebSocket message:", sendError);
       }
     } else {
-      console.warn(`WebSocket not connected for userId: ${userId}`);
+      this.redisPublisher.publish(
+        "message-channel",
+        JSON.stringify({ type, payload, userId })
+      );
+
+      console.warn(
+        `WebSocket not connected on this server instance, sending to the other server: ${userId}`
+      );
     }
   };
 
@@ -196,6 +220,7 @@ export class WebSocketClient {
 
     // Store the user
     this.CLIENTS.set(userId, ws);
+    this.redis.set(`userId-${userId}`, "1"); // 1-online , 0-offline
 
     if (!this.handlers.has(userId)) {
       this.handlers.set(userId, new Map());
@@ -205,6 +230,20 @@ export class WebSocketClient {
 
     this.send(userId, "userRegistered", {
       message: "User has Been Registered Successfully",
+    });
+  };
+
+  setUpRedis = () => {
+    this.redisSubscriber.subscribe("message-channel");
+
+    this.redisSubscriber.on("message", (_, raw) => {
+      const { type, payload, userId } = JSON.parse(raw);
+
+      const recpWs = this.CLIENTS.get(userId);
+
+      if (recpWs && recpWs.readyState === WebSocket.OPEN) {
+        recpWs.send(JSON.stringify({ type, payload }));
+      }
     });
   };
 
@@ -277,6 +316,7 @@ export class WebSocketClient {
       console.log("Room Already Exists! Reset the Session");
       return;
     }
+
     this.BoardState.set(roomId, { ...details });
   };
 

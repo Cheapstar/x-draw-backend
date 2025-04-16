@@ -134,7 +134,6 @@ export interface FreehandElement extends BaseElement {
   y2?: number;
   stroke: number[][];
   originalStroke: number[][];
-  path?: Path2D;
 }
 
 export interface ImageElement extends BaseElement {
