@@ -6,12 +6,20 @@ import { Element, ImageElement, Point } from "../types";
 import randomColor from "randomcolor";
 import { Redis } from "ioredis";
 
+// Redis Key Structure , just learned
+const KEYS = {
+  USER_STATUS: (userId: string) => `user:${userId}:status`,
+  ROOM_USERS: (roomId: string) => `room:${roomId}:users`,
+  ROOM_USER_DETAILS: (roomId: string, userId: string) =>
+    `room:${roomId}:user:${userId}`,
+  ROOM_MEMBERS: (roomId: string) => `room:${roomId}:members`,
+  WHITEBOARD_DATA: (roomId: string) => `whiteboard:${roomId}:data`,
+};
+
 export class WebSocketClient {
   private wss: WebSocketServer;
-  private CLIENTS: Map<string, WebSocket> = new Map<string, WebSocket>();
-  private handlers: Map<string, Map<string, handlerFn[]>> = new Map(); // user ---> handlerfn
-  private Rooms: Map<string, Map<string, UserDetails>> = new Map(); // room-Id --> userId,name
-  private BoardState: Map<string, BoardStateType> = new Map(); // room-Id ---> {initialScale,panOffset,elements}
+  private CLIENTS: Map<string, WebSocket> = new Map<string, WebSocket>(); // Storing Those ws which are connected to this server instance only
+  private handlers: Map<string, Map<string, handlerFn[]>> = new Map();
   private redis: Redis;
   private redisPublisher: Redis;
   private redisSubscriber: Redis;
@@ -64,7 +72,6 @@ export class WebSocketClient {
 
       ws.on("message", (rawData) => {
         try {
-          // Validate message data
           if (!rawData) {
             console.error("Received empty message");
             return;
@@ -99,33 +106,28 @@ export class WebSocketClient {
         }
       });
 
-      ws.on("close", () => {
+      ws.on("close", async () => {
         console.log("Client connection closed for userId:", userId);
 
-        // Check if the user is part of any room
-        let userRoomId: string | null = null;
+        try {
+          // Find all rooms the user is in
+          const userRooms = await this.findUserRooms(userId);
 
-        this.Rooms.forEach((roomUsers, roomId) => {
-          if (roomUsers.has(userId)) {
-            userRoomId = roomId;
-            roomUsers.delete(userId);
+          // Handle user leaving each room
+          for (const roomId of userRooms) {
+            await this.handleUserLeaveRoom(userId, roomId);
           }
-        });
 
-        // Broadcast that user left the room
-        if (userRoomId) {
-          console.log(`User ${userId} left room ${userRoomId}`);
-          this.broadCastRoom({
-            userId,
-            type: "remove-participant",
-            payload: { roomId: userRoomId, userId },
-          });
+          // Clean up resources
+          this.CLIENTS.delete(userId);
+          this.handlers.delete(userId);
+          await this.redis.del(KEYS.USER_STATUS(userId));
+        } catch (error) {
+          console.error(
+            `Error handling WebSocket close for userId ${userId}:`,
+            error
+          );
         }
-
-        // Cleanup resources
-        this.redis.del(`userId-${userId}`);
-        this.CLIENTS.delete(userId);
-        this.handlers.delete(userId);
       });
 
       // Add error handling for WebSocket
@@ -136,6 +138,80 @@ export class WebSocketClient {
       });
     });
   };
+
+  private async findUserRooms(userId: string): Promise<string[]> {
+    try {
+      // Get all keys that might indicate room membership
+      const keys = await this.redis.keys(`room:*:members`);
+      const userRooms: string[] = [];
+
+      for (const key of keys) {
+        const isMember = await this.redis.sismember(key, userId);
+        if (isMember) {
+          // Extract roomId from the key pattern
+          const roomId = key.split(":")[1];
+          userRooms.push(roomId);
+        }
+      }
+
+      return userRooms;
+    } catch (error) {
+      console.error(`Error finding rooms for user ${userId}:`, error);
+      return [];
+    }
+  }
+
+  private async handleUserLeaveRoom(userId: string, roomId: string) {
+    try {
+      console.log(`User ${userId} left room ${roomId}`);
+
+      // Remove user from room members
+      await this.redis.srem(KEYS.ROOM_MEMBERS(roomId), userId);
+
+      // Remove user details
+      await this.redis.del(KEYS.ROOM_USER_DETAILS(roomId, userId));
+
+      // Broadcast user left message
+      this.broadCastRoom({
+        userId,
+        type: "remove-participant",
+        payload: { roomId, userId },
+      });
+
+      // Check if room is empty and clean up if needed
+      const membersCount = await this.redis.scard(KEYS.ROOM_MEMBERS(roomId));
+      if (membersCount === 0) {
+        await this.cleanupEmptyRoom(roomId);
+      }
+    } catch (error) {
+      console.error(
+        `Error handling user ${userId} leaving room ${roomId}:`,
+        error
+      );
+    }
+  }
+
+  private async cleanupEmptyRoom(roomId: string) {
+    try {
+      console.log(`Cleaning up empty room ${roomId}`);
+
+      // Delete room data
+      const pipeline = this.redis.pipeline();
+      pipeline.del(KEYS.ROOM_MEMBERS(roomId));
+      pipeline.del(KEYS.WHITEBOARD_DATA(roomId));
+
+      // Delete any other room-related keys
+      const roomKeys = await this.redis.keys(`room:${roomId}:*`);
+      for (const key of roomKeys) {
+        pipeline.del(key);
+      }
+
+      await pipeline.exec();
+      console.log(`Room ${roomId} cleaned up successfully`);
+    } catch (error) {
+      console.error(`Error cleaning up room ${roomId}:`, error);
+    }
+  }
 
   private isValidUserId(userId: string): boolean {
     return userId.trim().length > 0 && userId.length <= 50;
@@ -188,261 +264,486 @@ export class WebSocketClient {
       return;
     }
 
-    const ws = this.CLIENTS.get(userId);
-    const userStatus = await this.redis.get(`userId-${userId}`);
+    try {
+      const ws = this.CLIENTS.get(userId);
+      const userStatus = await this.redis.get(KEYS.USER_STATUS(userId));
 
-    if (userStatus != "1") return;
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        const message = { type, payload };
-        ws.send(JSON.stringify(message));
-      } catch (sendError) {
-        console.error("Error sending WebSocket message:", sendError);
+      if (userStatus !== "1") {
+        console.log(`User ${userId} is offline, skipping message`);
+        return;
       }
-    } else {
-      this.redisPublisher.publish(
-        "message-channel",
-        JSON.stringify({ type, payload, userId })
-      );
 
-      console.warn(
-        `WebSocket not connected on this server instance, sending to the other server: ${userId}`
-      );
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          const message = { type, payload };
+          ws.send(JSON.stringify(message));
+        } catch (sendError) {
+          console.error("Error sending WebSocket message:", sendError);
+        }
+      } else {
+        // User is connected to a different server instance
+        this.redisPublisher.publish(
+          "message-channel",
+          JSON.stringify({ type, payload, userId })
+        );
+
+        console.log(
+          `WebSocket not connected on this server instance, sending to other server: ${userId}`
+        );
+      }
+    } catch (error) {
+      console.error(`Error in send method for user ${userId}:`, error);
     }
   };
 
-  registerUser = (userId: string, ws: WebSocket) => {
+  registerUser = async (userId: string, ws: WebSocket) => {
     if (!userId || !ws) {
       console.error("Invalid user registration parameters");
       return;
     }
 
-    // Store the user
-    this.CLIENTS.set(userId, ws);
-    this.redis.set(`userId-${userId}`, "1"); // 1-online , 0-offline
+    try {
+      // Store the user connection
+      this.CLIENTS.set(userId, ws);
 
-    if (!this.handlers.has(userId)) {
-      this.handlers.set(userId, new Map());
+      // Set user as online in Redis
+      await this.redis.set(KEYS.USER_STATUS(userId), "1", "EX", 7200); // TTL to prevent orphaned keys , not necessary but just checking
+
+      if (!this.handlers.has(userId)) {
+        this.handlers.set(userId, new Map());
+      }
+
+      console.log("User has been Registered:", userId);
+
+      this.send(userId, "userRegistered", {
+        message: "User has Been Registered Successfully",
+      });
+    } catch (error) {
+      console.error(`Error registering user ${userId}:`, error);
     }
-
-    console.log("User has been Registered:", userId);
-
-    this.send(userId, "userRegistered", {
-      message: "User has Been Registered Successfully",
-    });
   };
 
   setUpRedis = () => {
     this.redisSubscriber.subscribe("message-channel");
 
     this.redisSubscriber.on("message", (_, raw) => {
-      const { type, payload, userId } = JSON.parse(raw);
+      try {
+        const { type, payload, userId } = JSON.parse(raw);
 
-      const recpWs = this.CLIENTS.get(userId);
+        const recpWs = this.CLIENTS.get(userId);
 
-      if (recpWs && recpWs.readyState === WebSocket.OPEN) {
-        recpWs.send(JSON.stringify({ type, payload }));
+        if (recpWs && recpWs.readyState === WebSocket.OPEN) {
+          recpWs.send(JSON.stringify({ type, payload }));
+        }
+      } catch (error) {
+        console.error("Error processing Redis message:", error);
       }
     });
+
+    console.log("Redis pub/sub setup complete");
   };
 
   public getClientIds = (): string[] => {
     return Array.from(this.CLIENTS.keys());
   };
 
-  public createRoom = (): string => {
+  public createRoom = async (userId: string): Promise<string> => {
     const roomId = crypto.randomUUID();
-    this.Rooms.set(roomId, new Map<string, UserDetails>());
-
+    console.log(`Creating new room with ID: ${roomId} for user ${userId}`);
     return roomId;
   };
 
-  private joinRoom = ({ userId, payload }: Args) => {
+  private joinRoom = async ({ userId, payload }: Args) => {
     if (!userId || !payload || !payload.roomId) {
       console.warn("Invalid room join parameters");
       return;
     }
 
-    const { roomId, name } = payload;
-    const userColor = randomColor();
+    try {
+      const { roomId, name } = payload;
+      const userColor = randomColor();
 
-    // Check if room exists
-    if (!this.Rooms.has(roomId)) {
-      console.warn(`Attempt to join non-existent room: ${roomId}`);
-      return;
+      // Store user details in Redis
+      const userDetails = {
+        userName: name || "Anonymous",
+        color: userColor,
+      };
+
+      await this.redis.set(
+        KEYS.ROOM_USER_DETAILS(roomId, userId),
+        JSON.stringify(userDetails)
+      );
+
+      // Add user to room members
+      await this.redis.sadd(KEYS.ROOM_MEMBERS(roomId), userId);
+
+      // Get board state
+      const boardStateJson = await this.redis.get(KEYS.WHITEBOARD_DATA(roomId));
+
+      if (!boardStateJson) {
+        console.warn(`No board state found for room: ${roomId}`);
+        return;
+      }
+
+      console.log(`User ${name} (${userId}) joined room ${roomId}`);
+
+      // Send room data to the user
+      this.send(userId, "room-joined", JSON.parse(boardStateJson));
+
+      // Broadcast to others that someone joined
+      this.broadCastRoom({
+        userId,
+        type: "add-participant",
+        payload: { roomId, userId, userDetails },
+      });
+    } catch (error) {
+      console.error(`Error joining room for user ${userId}:`, error);
     }
-
-    this.Rooms.get(roomId)?.set(userId, {
-      userName: name || "Anonymous",
-      color: userColor,
-    });
-    const boardState = this.BoardState.get(roomId);
-    console.log("User with name has joined", name);
-
-    if (!boardState) {
-      console.warn("No Board State Present for the given Room");
-      return;
-    }
-
-    this.send(userId, "room-joined", { ...boardState });
   };
 
-  private leaveRoom = ({ userId, payload }: Args) => {
-    if (!userId || !payload.roomId) {
+  private leaveRoom = async ({ userId, payload }: Args) => {
+    if (!userId || !payload || !payload.roomId) {
       console.warn("Invalid room leave parameters");
       return;
     }
 
-    // Check if room exists before attempting to remove user
-    if (this.Rooms.has(payload.roomId)) {
-      this.Rooms.get(payload.roomId)?.delete(userId);
+    try {
+      const { roomId } = payload;
+      await this.handleUserLeaveRoom(userId, roomId);
+    } catch (error) {
+      console.error(`Error leaving room for user ${userId}:`, error);
+    }
+  };
 
-      console.log("User has left the Room");
-      this.broadCastRoom({
-        userId,
-        type: "remove-participant",
-        payload: { roomId: payload.roomId, userId },
-      });
+  initialiseWhiteboard = async (roomId: string, details: BoardStateType) => {
+    try {
+      // Check if room whiteboard data already exists
+      const exists = await this.redis.exists(KEYS.WHITEBOARD_DATA(roomId));
 
-      if (this.Rooms.get(payload.roomId)?.size === 0) {
-        this.Rooms.delete(payload.roomId);
+      if (exists) {
+        console.log(`Room ${roomId} already exists! Reset the session`);
+        return;
       }
-    }
-  };
 
-  initialiseWhiteboard = (roomId: string, details: BoardStateType) => {
-    if (this.BoardState.has(roomId)) {
-      console.log("Room Already Exists! Reset the Session");
-      return;
-    }
-
-    this.BoardState.set(roomId, { ...details });
-  };
-
-  private handleMousePosition = ({ userId, payload }: Args) => {
-    const userDetails = this.Rooms.get(payload.roomId)?.get(userId);
-    this.broadCastRoom({
-      userId,
-      type: "participant-position",
-      payload: { ...payload, userDetails },
-    });
-  };
-
-  private broadCastRoom = ({ userId, type, payload }: BroadCastRoom) => {
-    // Collect all the userId except the sender
-    if (this.Rooms.has(payload.roomId)) {
-      const receivers = Array.from(
-        (this.Rooms.get(payload.roomId) as Map<string, UserDetails>).keys()
+      // Store the initial whiteboard data
+      await this.redis.set(
+        KEYS.WHITEBOARD_DATA(roomId),
+        JSON.stringify(details),
+        "EX",
+        86400 // 24 hour TTL to prevent orphaned data
       );
 
-      for (const rec of receivers) {
-        if (rec !== userId) {
-          this.send(rec, type, payload);
-        }
+      console.log(`Whiteboard initialized for room ${roomId}`);
+    } catch (error) {
+      console.error(`Error initializing whiteboard for room ${roomId}:`, error);
+    }
+  };
+
+  private handleMousePosition = async ({ userId, payload }: Args) => {
+    try {
+      if (!payload || !payload.roomId) {
+        console.warn("Invalid mouse position payload");
+        return;
       }
-    }
-  };
 
-  private handleNewElement = ({ userId, payload }: Args) => {
-    const { element, roomId } = payload as NewElementPayload;
+      const userDetailsJson = await this.redis.get(
+        KEYS.ROOM_USER_DETAILS(payload.roomId, userId)
+      );
 
-    this.broadCastRoom({
-      userId,
-      type: "draw-element",
-      payload: { newElement: element, roomId },
-    });
+      if (!userDetailsJson) {
+        console.warn(
+          `User details not found for user ${userId} in room ${payload.roomId}`
+        );
+        return;
+      }
 
-    this.updateBoardState({ roomId, element });
-  };
-
-  private handleElementMove = ({ userId, payload }: Args) => {
-    const { element, roomId } = payload;
-
-    // broadcast this into the room
-    this.broadCastRoom({ userId, type: "move-element", payload });
-
-    this.updateBoardState({ roomId, element });
-  };
-
-  private handleElementResize = ({ userId, payload }: Args) => {
-    const { element, roomId } = payload;
-
-    this.broadCastRoom({ userId, type: "resize-element", payload });
-
-    this.updateBoardState({
-      roomId,
-      element,
-    });
-  };
-
-  private eraseElements = (eraseElements: Element[], roomId: string) => {
-    const boardState = this.BoardState.get(roomId);
-
-    if (!boardState) {
-      console.warn(`No board state found for room: ${roomId}`);
-      return;
-    }
-
-    boardState.elements.filter(
-      (element) =>
-        !eraseElements.some((eraseElement) => eraseElement.id === element.id)
-    );
-  };
-
-  private handleElementErase = ({ userId, payload }: Args) => {
-    this.broadCastRoom({ userId, type: "erase-elements", payload });
-    this.eraseElements(payload.elements, payload.roomId);
-  };
-
-  private handleElementUpdate = ({ userId, payload }: Args) => {
-    this.broadCastRoom({ userId, type: "update-element", payload });
-
-    this.updateBoardState({ roomId: payload.roomId, element: payload.element });
-  };
-
-  private handleImageAdd = ({ userId, payload }: Args) => {
-    console.log("Image is Received");
-    this.broadCastRoom({ userId, type: "add-images", payload });
-
-    for (let i = 0; i < payload.elements.length; i++) {
-      this.updateBoardState({
-        roomId: payload.roomId,
-        element: payload.elements[i],
+      this.broadCastRoom({
+        userId,
+        type: "participant-position",
+        payload: {
+          ...payload,
+          userDetails: JSON.parse(userDetailsJson),
+        },
       });
+    } catch (error) {
+      console.error(`Error handling mouse position for user ${userId}:`, error);
     }
   };
 
-  private updateBoardState = ({ roomId, element }: BoardStateUpdate) => {
-    // Ensure the room exists in BoardState
-    const boardState = this.BoardState.get(roomId);
-    if (!boardState) {
-      console.warn(`No board state found for room: ${roomId}`);
-      return;
-    }
-
-    // Update elements immutably
-    const updatedElements = boardState.elements.map((ele) => {
-      if (ele.id === element.id) {
-        if (element.type === "image") {
-          return {
-            ...element,
-            url: (ele as ImageElement).url,
-          };
-        }
-
-        return element;
+  private broadCastRoom = async ({ userId, type, payload }: BroadCastRoom) => {
+    try {
+      if (!payload || !payload.roomId) {
+        console.warn("Invalid broadcast parameters");
+        return;
       }
-      return ele;
-    });
 
-    // If element is new, add it
-    if (!updatedElements.some((ele) => ele.id === element.id)) {
-      updatedElements.push(element);
+      // Check if room exists
+      const exists = await this.roomExists(payload.roomId);
+
+      if (!exists) {
+        console.warn(
+          `Attempted to broadcast to non-existent room: ${payload.roomId}`
+        );
+        return;
+      }
+
+      // Get all room members
+      const members = await this.redis.smembers(
+        KEYS.ROOM_MEMBERS(payload.roomId)
+      );
+
+      // Send message to all members except sender
+      for (const memberId of members) {
+        if (memberId !== userId) {
+          await this.send(memberId, type, payload);
+        }
+      }
+    } catch (error) {
+      console.error(`Error broadcasting to room:`, error);
     }
+  };
 
-    // Mutate `BoardState` safely
-    boardState.elements = updatedElements;
+  private handleNewElement = async ({ userId, payload }: Args) => {
+    try {
+      if (!payload) {
+        console.warn("Invalid new element payload");
+        return;
+      }
+
+      const { element, roomId } = payload as NewElementPayload;
+
+      if (!element || !roomId) {
+        console.warn("Missing element or roomId in payload");
+        return;
+      }
+
+      // Broadcast to all room members
+      await this.broadCastRoom({
+        userId,
+        type: "draw-element",
+        payload: { newElement: element, roomId },
+      });
+
+      // Update board state
+      await this.updateBoardState({ roomId, element });
+    } catch (error) {
+      console.error(`Error handling new element:`, error);
+    }
+  };
+
+  private handleElementMove = async ({ userId, payload }: Args) => {
+    try {
+      if (!payload || !payload.element || !payload.roomId) {
+        console.warn("Invalid element move payload");
+        return;
+      }
+
+      const { element, roomId } = payload;
+
+      // Broadcast to room
+      await this.broadCastRoom({
+        userId,
+        type: "move-element",
+        payload,
+      });
+
+      // Update board state
+      await this.updateBoardState({ roomId, element });
+    } catch (error) {
+      console.error(`Error handling element move:`, error);
+    }
+  };
+
+  private handleElementResize = async ({ userId, payload }: Args) => {
+    try {
+      if (!payload || !payload.element || !payload.roomId) {
+        console.warn("Invalid element resize payload");
+        return;
+      }
+
+      const { element, roomId } = payload;
+
+      // Broadcast to room
+      await this.broadCastRoom({
+        userId,
+        type: "resize-element",
+        payload,
+      });
+
+      // Update board state
+      await this.updateBoardState({ roomId, element });
+    } catch (error) {
+      console.error(`Error handling element resize:`, error);
+    }
+  };
+
+  private eraseElements = async (
+    eraseElements: Element[],
+    roomId: string,
+    userId: string
+  ) => {
+    try {
+      // Get current board state
+      const boardStateJson = await this.redis.get(KEYS.WHITEBOARD_DATA(roomId));
+
+      if (!boardStateJson) {
+        console.warn(`No board state found for room: ${roomId}`);
+        return;
+      }
+
+      const boardState = JSON.parse(boardStateJson);
+
+      // Filter out erased elements
+      const updatedElements = boardState.elements.filter(
+        (element: Element) =>
+          !eraseElements.some((eraseElement) => eraseElement.id === element.id)
+      );
+
+      // Update board state
+      await this.redis.set(
+        KEYS.WHITEBOARD_DATA(roomId),
+        JSON.stringify({
+          ...boardState,
+          elements: updatedElements,
+        })
+      );
+
+      console.log(
+        `Erased ${eraseElements.length} elements from room ${roomId}`
+      );
+    } catch (error) {
+      console.error(`Error erasing elements:`, error);
+    }
+  };
+
+  private handleElementErase = async ({ userId, payload }: Args) => {
+    try {
+      if (!payload || !payload.elements || !payload.roomId) {
+        console.warn("Invalid element erase payload");
+        return;
+      }
+
+      // Broadcast to room
+      await this.broadCastRoom({
+        userId,
+        type: "erase-elements",
+        payload,
+      });
+
+      // Update board state
+      await this.eraseElements(payload.elements, payload.roomId, userId);
+    } catch (error) {
+      console.error(`Error handling element erase:`, error);
+    }
+  };
+
+  private handleElementUpdate = async ({ userId, payload }: Args) => {
+    try {
+      if (!payload || !payload.element || !payload.roomId) {
+        console.warn("Invalid element update payload");
+        return;
+      }
+
+      // Broadcast to room
+      await this.broadCastRoom({
+        userId,
+        type: "update-element",
+        payload,
+      });
+
+      // Update board state
+      await this.updateBoardState({
+        roomId: payload.roomId,
+        element: payload.element,
+      });
+    } catch (error) {
+      console.error(`Error handling element update:`, error);
+    }
+  };
+
+  private handleImageAdd = async ({ userId, payload }: Args) => {
+    try {
+      if (!payload || !payload.elements || !payload.roomId) {
+        console.warn("Invalid image add payload");
+        return;
+      }
+
+      console.log(
+        `Processing ${payload.elements.length} images for room ${payload.roomId}`
+      );
+
+      // Broadcast to room
+      await this.broadCastRoom({
+        userId,
+        type: "add-images",
+        payload,
+      });
+
+      // Update board state for each image
+      for (const element of payload.elements) {
+        await this.updateBoardState({
+          roomId: payload.roomId,
+          element: element,
+        });
+      }
+    } catch (error) {
+      console.error(`Error handling image add:`, error);
+    }
+  };
+
+  private updateBoardState = async ({ roomId, element }: BoardStateUpdate) => {
+    try {
+      // Get current board state
+      const boardStateJson = await this.redis.get(KEYS.WHITEBOARD_DATA(roomId));
+
+      if (!boardStateJson) {
+        console.warn(`No board state found for room: ${roomId}`);
+        return;
+      }
+
+      const boardState = JSON.parse(boardStateJson);
+
+      // Look for existing element to update
+      let elementExists = false;
+      const updatedElements = boardState.elements.map((ele: Element) => {
+        if (ele.id === element.id) {
+          elementExists = true;
+
+          if (element.type === "image" && (ele as ImageElement).url) {
+            return {
+              ...element,
+              url: (ele as ImageElement).url,
+            };
+          }
+
+          return { ...element };
+        }
+        return ele;
+      });
+
+      // If element is new, add it
+      if (!elementExists) {
+        updatedElements.push(element);
+      }
+
+      // Update Redis with new board state
+      await this.redis.set(
+        KEYS.WHITEBOARD_DATA(roomId),
+        JSON.stringify({ ...boardState, elements: updatedElements })
+      );
+    } catch (error) {
+      console.error(`Error updating board state:`, error);
+    }
+  };
+
+  private roomExists = async (roomId: string): Promise<boolean> => {
+    try {
+      const exists = await this.redis.exists(KEYS.ROOM_MEMBERS(roomId));
+      return exists === 1;
+    } catch (error) {
+      console.error(`Error checking if room ${roomId} exists:`, error);
+      return false;
+    }
   };
 
   private initWs = (userId: string) => {

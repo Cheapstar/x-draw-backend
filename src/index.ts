@@ -72,11 +72,11 @@ app.get("/fetch-elements", (req: Request, res: Response) => {
   });
 });
 
-app.post("/start-session", (req, res) => {
+app.post("/start-session", async (req, res) => {
   // Create a new Room and send back the roomId
   // using which the user will join the room
   // create room will create a room in the redis
-  const roomId = webSocket.createRoom();
+  const roomId = await webSocket.createRoom(req.body.userId);
   const { elements, scale, panOffset } = req.body;
   webSocket.initialiseWhiteboard(roomId, { elements, scale, panOffset });
 
