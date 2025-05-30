@@ -27,7 +27,7 @@ npm install
 To build and start the server:
 
 ```bash
-npm run build
+npm run dev
 ```
 
 > This will compile the server and start it automatically.
@@ -52,8 +52,7 @@ npm run build
 
 ## 🛠️ Scripts
 
-- `npm run build`: Builds and starts the server
-- `npm run dev`: (if available) Runs the server in development mode with hot reload
+- `npm run dev`: Builds and starts the server
 
 ## 📁 File Structure (optional)
 
