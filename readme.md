@@ -1,11 +1,6 @@
----
-
-````markdown
 # 🖊️ x-draw-backend
 
 The backend server for **x-draw**, a collaborative whiteboard application. This server handles WebSocket communication, Redis-based state management, and other core backend features.
-
----
 
 ## 🚀 Getting Started
 
@@ -19,8 +14,6 @@ cp .env.example .env
 
 Then fill in the required environment variables in `.env`.
 
----
-
 ### 2. 🔧 Install Dependencies
 
 Make sure you're in the project directory and run:
@@ -28,8 +21,6 @@ Make sure you're in the project directory and run:
 ```bash
 npm install
 ```
-
----
 
 ### 3. 🔨 Build and Run
 
@@ -41,8 +32,6 @@ npm run build
 
 > This will compile the server and start it automatically.
 
----
-
 ## 📦 Dependencies
 
 - **Node.js**
@@ -50,8 +39,6 @@ npm run build
 - **ioredis**
 - **ws** (WebSocket library)
 - **dotenv**
-
----
 
 ## 💬 Notes
 
@@ -63,14 +50,10 @@ npm run build
 
 - This project assumes Redis is available at the host and port you specify in your `.env` (default: `redis://127.0.0.1:6379`).
 
----
-
 ## 🛠️ Scripts
 
 - `npm run build`: Builds and starts the server
 - `npm run dev`: (if available) Runs the server in development mode with hot reload
-
----
 
 ## 📁 File Structure (optional)
 
@@ -86,14 +69,6 @@ x-draw-backend/
 └── package.json
 ```
 
----
-
 ## 📬 License
 
 MIT
-
-```
-
----
-
-```
