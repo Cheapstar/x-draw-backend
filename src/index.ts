@@ -2,7 +2,9 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import { WebSocketClient } from "./webSocketServer/WebSocketServer";
 import Redis from "ioredis";
+import dotenv from "dotenv";
 
+dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
@@ -13,9 +15,9 @@ const httpServer = app.listen(8080, () => {
   console.log("App is running on server http://localhost:8080");
 });
 
-const redis = new Redis();
-const redisPublisher = new Redis();
-const redisSubscriber = new Redis();
+const redis = new Redis(process.env.REDIS_URL!);
+const redisPublisher = new Redis(process.env.REDIS_URL!);
+const redisSubscriber = new Redis(process.env.REDIS_URL!);
 const webSocket = new WebSocketClient(
   httpServer,
   redis,
