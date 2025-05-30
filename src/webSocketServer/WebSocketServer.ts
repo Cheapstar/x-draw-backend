@@ -23,6 +23,7 @@ export class WebSocketClient {
   private redis: Redis;
   private redisPublisher: Redis;
   private redisSubscriber: Redis;
+  private jobQueue: Promise<void> = Promise.resolve();
 
   constructor(
     server: HTTPServer,
@@ -88,18 +89,22 @@ export class WebSocketClient {
           const { payload, type } = parsedData;
 
           // Execute appropriate event handlers
-          const userHandlers = this.handlers.get(userId)?.get(type);
-          if (!userHandlers || userHandlers.length === 0) {
+          const typeHandlers = this.handlers.get(userId)?.get(type);
+          if (!typeHandlers || typeHandlers.length === 0) {
             console.warn(`No handlers found for type: ${type}`);
             return;
           }
 
-          userHandlers.forEach((handler) => {
-            try {
-              handler({ userId, payload });
-            } catch (handlerError) {
-              console.error(`Error in handler for type ${type}:`, handlerError);
-            }
+          const nextJob = this.jobQueue.then(async () => {
+            await Promise.all(
+              typeHandlers.map((handler) => handler({ userId, payload }))
+            );
+          });
+
+          this.jobQueue = nextJob;
+
+          nextJob.catch((err) => {
+            console.log("Error Occured While executing the Job", err);
           });
         } catch (parseError) {
           console.error("Error parsing message:", parseError);
